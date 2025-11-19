@@ -1,12 +1,15 @@
 """
-Multivariable-adjusted logistic regression (per protein/metabolite)
-with robust HC3 SE and BH–FDR.
+Proteins-only association analysis (CSV version, polished)
 
-- Outcome: binary (e.g., incident AD)
-- Covariates: specified in COVARS below.
+- Adjusted logistic regression per protein (incident dementia: 0/1)
+  -> OR per 1-SD, 95% CI, p, BH–FDR
+- Reads outcome + covariates once; then reads ONE protein column at a time from CSV.
+- Outputs tidy results + a colorful FDR-annotated forest plot.
+
+Requires: pandas, numpy, statsmodels, scipy, matplotlib
 """
 
-import argparse
+import os
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
@@ -15,72 +18,92 @@ from scipy.stats import norm
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 
+# =========================
+# CONFIG
+# =========================
+CSV_PATH = "multiomics_features.csv"   # your CSV dataset
+OUTCOME = "diagn"                                   # 0/1 incident dementia
 
-def fit_logistic_for_feature(
-    csv_path: str,
-    outcome: str,
-    covars,
-    feature_col: str,
-    max_na_frac: float = 0.20,
-    min_sample: int = 200,
-    log1p_features: bool = True,
-    zscore_features: bool = True,
-    robust_se: bool = True,
-):
-    usecols = [outcome] + covars
-    df_cov = pd.read_csv(csv_path, usecols=usecols)
-    df_cov = df_cov.replace([np.inf, -np.inf], np.nan)
-    df_cov = df_cov.dropna(subset=[outcome] + covars)
+# Covariates for adjustment (edit if needed)
+COVARS = ["Sex","Age","Education","Ethnicity","APOE4"]
 
-    y_all = df_cov[outcome].astype(int)
-    Xcov = pd.get_dummies(df_cov[covars], drop_first=True)
-    Xcov = sm.add_constant(Xcov, has_constant="add")
+# List proteins (or set to None to auto-detect)
+PROTEIN_COLUMNS = ["GFAP", "APOE", "NEFL", "GDF15", "ACTA2", "EDA2R", "LECT2", "LTBP2", "SCARF2", "ELN", "WNT9A"]
 
-    n_base = len(df_cov)
+# Transformations
+LOG1P_FEATURES = True
+ZSCORE_FEATURES = True
+ROBUST_SE = True
 
+# Thresholds / outputs
+MAX_NA_FRAC = 0.20
+MIN_SAMPLE = 200
+OUTPUT_PREFIX = "./proteins_assoc"
+MAKE_FOREST_PLOT = True
+TOP_N_PLOT = 25
+# =========================
+
+# ---------- Load outcome + covariates once ----------
+usecols = [OUTCOME] + COVARS
+df_cov = pd.read_csv(CSV_PATH, usecols=usecols)
+df_cov = df_cov.replace([np.inf, -np.inf], np.nan)
+df_cov = df_cov.dropna(subset=[OUTCOME] + COVARS)
+
+y_all = df_cov[OUTCOME].astype(int)
+Xcov = pd.get_dummies(df_cov[COVARS], drop_first=True)
+Xcov = sm.add_constant(Xcov, has_constant="add")
+
+n_base = len(df_cov)
+
+# ---------- Auto-detect protein columns if None ----------
+if PROTEIN_COLUMNS is None:
+    hdr = pd.read_csv(CSV_PATH, nrows=0)
+    exclude = set([OUTCOME] + COVARS)
+    PROTEIN_COLUMNS = [c for c in hdr.columns if c not in exclude]
+
+# Deduplicate
+PROTEIN_COLUMNS = list(dict.fromkeys(PROTEIN_COLUMNS))
+print(f"Analyzing {len(PROTEIN_COLUMNS)} proteins; base N = {n_base}")
+
+results = []
+
+# ---------- Fit logistic regression per protein ----------
+def fit_logistic_for_protein(protein_col: str):
     try:
-        ser = pd.read_csv(csv_path, usecols=[feature_col])[feature_col]
+        ser = pd.read_csv(CSV_PATH, usecols=[protein_col])[protein_col]
     except Exception as e:
-        return {"feature": feature_col, "n": 0, "status": f"missing_column: {e}"}
+        return {"feature": protein_col, "n": 0, "status": f"missing_column: {e}"}
 
-    df = pd.concat(
-        [
-            y_all.reset_index(drop=True),
-            Xcov.reset_index(drop=True),
-            ser.reset_index(drop=True),
-        ],
-        axis=1,
-    ).rename(columns={feature_col: "feature"})
+    df = pd.concat([y_all.reset_index(drop=True),
+                    Xcov.reset_index(drop=True),
+                    ser.reset_index(drop=True)], axis=1).rename(columns={protein_col: "protein"})
 
-    n_nonmissing = df["feature"].notna().sum()
+    n_nonmissing = df["protein"].notna().sum()
     na_frac = 1.0 - (n_nonmissing / n_base)
-    if na_frac > max_na_frac:
-        return {
-            "feature": feature_col,
-            "n": int(n_nonmissing),
-            "status": f"too_many_missing({na_frac:.2f})",
-        }
+    if na_frac > MAX_NA_FRAC:
+        return {"feature": protein_col, "n": int(n_nonmissing), "status": f"too_many_missing({na_frac:.2f})"}
 
-    df = df.dropna(subset=["feature"])
+    df = df.dropna(subset=["protein"])
     n_total = len(df)
-    if n_total < min_sample:
-        return {"feature": feature_col, "n": n_total, "status": "too_few_samples"}
+    if n_total < MIN_SAMPLE:
+        return {"feature": protein_col, "n": n_total, "status": "too_few_samples"}
 
-    x = df["feature"].astype(float).copy()
-    if log1p_features and (x.dropna() >= 0).all():
+    # Transform
+    x = df["protein"].astype(float).copy()
+    if LOG1P_FEATURES and (x.dropna() >= 0).all():
         x = np.log1p(x)
-    if zscore_features:
+    if ZSCORE_FEATURES:
         mu, sd = x.mean(skipna=True), x.std(skipna=True)
         if (sd is None) or (not np.isfinite(sd)) or (sd <= 0):
-            return {"feature": feature_col, "n": n_total, "status": "zero_variance"}
+            return {"feature": protein_col, "n": n_total, "status": "zero_variance"}
         x = (x - mu) / sd
 
-    X = pd.concat([df[Xcov.columns], x.rename("feature")], axis=1).astype(float)
-    y = df[outcome].astype(int).values
+    X = pd.concat([df[Xcov.columns], x.rename("protein")], axis=1).astype(float)
+    y = df[OUTCOME].astype(int).values
 
     try:
         fit = sm.Logit(y, X.values).fit(disp=False)
-        if robust_se:
+        if ROBUST_SE:
             fit_rb = sm.Logit(y, X.values).fit(disp=False, cov_type="HC3")
             coef, se = float(fit.params[-1]), float(fit_rb.bse[-1])
         else:
@@ -92,136 +115,57 @@ def fit_logistic_for_feature(
         CI_high = float(np.exp(coef + z_crit * se))
         pval = float(2 * (1 - norm.cdf(abs(coef / se))))
 
-        return {
-            "feature": feature_col,
-            "n": n_total,
-            "OR_per_SD": OR,
-            "CI95_low": CI_low,
-            "CI95_high": CI_high,
-            "p": pval,
-            "status": "ok",
-        }
+        return {"feature": protein_col, "n": n_total, "OR_per_SD": OR,
+                "CI95_low": CI_low, "CI95_high": CI_high, "p": pval, "status": "ok"}
     except Exception as e:
-        return {"feature": feature_col, "n": n_total, "status": f"fit_fail: {e}"}
+        return {"feature": protein_col, "n": n_total, "status": f"fit_fail: {e}"}
 
+# ---------- Run ----------
+for i, prot in enumerate(PROTEIN_COLUMNS, 1):
+    out = fit_logistic_for_protein(prot)
+    if out: results.append(out)
+    if i % 50 == 0:
+        print(f"... processed {i}/{len(PROTEIN_COLUMNS)} proteins")
 
-def run_association(
-    csv_path: str,
-    outcome: str,
-    covars,
-    feature_columns,
-    output_prefix: str,
-    make_forest_plot: bool = True,
-    top_n_plot: int = 25,
-):
-    results = []
-    for i, feat in enumerate(feature_columns, 1):
-        res = fit_logistic_for_feature(
-            csv_path=csv_path,
-            outcome=outcome,
-            covars=covars,
-            feature_col=feat,
-        )
-        results.append(res)
-        if i % 50 == 0:
-            print(f"... processed {i}/{len(feature_columns)} features")
+res = pd.DataFrame(results)
+ok = res[res["status"] == "ok"].copy()
+if len(ok):
+    ok = ok.sort_values("p")
+    ok["FDR"] = multipletests(ok["p"], method="fdr_bh")[1]
+    ok = ok.reset_index(drop=True)
 
-    res_df = pd.DataFrame(results)
-    ok = res_df[res_df["status"] == "ok"].copy()
-    if len(ok):
-        ok = ok.sort_values("p")
-        ok["FDR"] = multipletests(ok["p"], method="fdr_bh")[1]
-        ok = ok.reset_index(drop=True)
+# ---------- Save ----------
+ok.to_csv(f"{OUTPUT_PREFIX}_logistic_associations.csv", index=False)
+res.to_csv(f"{OUTPUT_PREFIX}_logistic_all_status.csv", index=False)
+print(f"Saved: {OUTPUT_PREFIX}_logistic_associations.csv (n={len(ok)})")
 
-    ok.to_csv(f"{output_prefix}_logistic_associations.csv", index=False)
-    res_df.to_csv(f"{output_prefix}_logistic_all_status.csv", index=False)
-    print(f"Saved: {output_prefix}_logistic_associations.csv (n={len(ok)})")
+# ---------- Forest Plot (clean labels, no FDR on y-axis) ----------
+if MAKE_FOREST_PLOT and len(ok):
+    top = ok.sort_values(["FDR", "p"]).head(TOP_N_PLOT).copy()
+    ypos = np.arange(len(top))[::-1]
 
-    if make_forest_plot and len(ok):
-        top = ok.sort_values(["FDR", "p"]).head(top_n_plot).copy()
-        ypos = np.arange(len(top))[::-1]
+    # Only metabolite names in y-axis labels
+    top["label"] = top["feature"]
 
-        top["label"] = top["feature"]
-        colors = cm.tab10(np.linspace(0, 1, len(top)))
+    colors = cm.tab10(np.linspace(0, 1, len(top)))
 
-        plt.figure(figsize=(8, 0.5 * len(top) + 2))
-        for y_i, lo, hi, c in zip(ypos, top["CI95_low"], top["CI95_high"], colors):
-            plt.plot([lo, hi], [y_i, y_i], linewidth=6, color=c)
+    plt.figure(figsize=(8, 0.5*len(top) + 2))
+    for y_i, lo, hi, c in zip(ypos, top["CI95_low"], top["CI95_high"], colors):
+        plt.plot([lo, hi], [y_i, y_i], linewidth=6, color=c)
 
-        plt.axvline(1.0, linestyle="--", linewidth=2.5, color="red")
+    plt.axvline(1.0, linestyle="--", linewidth=2.5, color="red")
 
-        sig_mask = top["FDR"] < 0.05
-        plt.scatter(
-            top["OR_per_SD"][sig_mask],
-            ypos[sig_mask],
-            s=300,
-            color=colors[sig_mask],
-            edgecolors="black",
-            zorder=3,
-        )
-        plt.scatter(
-            top["OR_per_SD"][~sig_mask],
-            ypos[~sig_mask],
-            s=300,
-            facecolors="none",
-            edgecolors=colors[~sig_mask],
-            linewidth=3.5,
-            zorder=3,
-        )
+    sig_mask = top["FDR"] < 0.05
+    plt.scatter(top["OR_per_SD"][sig_mask], ypos[sig_mask], s=300,
+                color=colors[sig_mask], edgecolors="black", zorder=3)
+    plt.scatter(top["OR_per_SD"][~sig_mask], ypos[~sig_mask], s=300,
+                facecolors="none", edgecolors=colors[~sig_mask], linewidth=3.5, zorder=3)
 
-        plt.yticks(ypos, top["label"].tolist(), fontsize=12)
-        plt.xlabel("Odds Ratio per 1-SD (95% CI)", fontsize=14)
-        plt.title("Incident dementia", fontsize=14, weight="bold")
-        plt.tight.tight_layout()
-        plt.savefig(f"{output_prefix}_forest.pdf", bbox_inches="tight", dpi=300)
-        plt.show()
+    plt.yticks(ypos, top["label"].tolist(), fontsize=20)
+    plt.xticks(fontsize=18)
+    plt.xlabel("Odds Ratio per 1-SD (95% CI)", fontsize=20)
+    plt.title("Incident AD", fontsize=20, weight="bold")
+    plt.tight_layout()
+    plt.savefig(f"{OUTPUT_PREFIX}_AD.pdf", bbox_inches="tight", dpi=400)
+    plt.show()
 
-
-def cli():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", type=str, required=True)
-    parser.add_argument("--outcome", type=str, default="diagn")
-    parser.add_argument(
-        "--output_prefix",
-        type=str,
-        default="./omics_assoc",
-    )
-    parser.add_argument(
-        "--features",
-        nargs="+",
-        default=None,
-        help="Optional list of features; if omitted, auto-detect all non-covariates.",
-    )
-    args = parser.parse_args()
-
-    # Adjust to match your exact covariates
-    COVARS = [
-        "Sex",
-        "Education years",
-        "Smoking",
-        "BMI",
-        "Age",
-        "IPAQ",
-        "Sleep",
-        "Ethnicity",
-        "APOE4",
-    ]
-
-    if args.features is None:
-        hdr = pd.read_csv(args.csv, nrows=0)
-        exclude = set([args.outcome] + COVARS)
-        feature_columns = [c for c in hdr.columns if c not in exclude]
-    else:
-        feature_columns = args.features
-
-    run_association(
-        csv_path=args.csv,
-        outcome=args.outcome,
-        covars=COVARS,
-        feature_columns=feature_columns,
-        output_prefix=args.output_prefix,
-    )
-
-
-if __name__ == "__main__":
-    cli()
