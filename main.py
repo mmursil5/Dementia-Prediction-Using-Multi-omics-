@@ -2,7 +2,7 @@ from sklearn.model_selection import train_test_split
 
 from src.data.preprocessing import load_data, preprocess_features, select_and_rank_features
 from src.training.feature_selection import sequential_forward_selection_ranked
-from src.training.training import train_model_with_smote, evaluate_model
+from src.training.training import train_model_with_randomundersampler, evaluate_model   # <-- changed
 from src.analysis.explainability import plot_permutation_importance, shap_summary_plot
 
 
@@ -41,8 +41,8 @@ def main():
     for f in selected_features_sfs:
         print("  -", f)
 
-    # 6. Train final DNN with SMOTE
-    model = train_model_with_smote(X_train_sfs, y_train)
+    # 6. Train final DNN with RandomUnderSampler
+    model = train_model_with_randomundersampler(X_train_sfs, y_train)
 
     # 7. Evaluate on test set
     metrics, y_prob_pos, y_pred = evaluate_model(model, X_test_sfs, y_test)
