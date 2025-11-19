@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from imblearn.over_sampling import SMOTE
+from imblearn.under_sampling import RandomUnderSampler   
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -16,7 +16,7 @@ from sklearn.metrics import (
 from src.models.models import RegularizedDNN
 
 
-def train_model_with_smote(
+def train_model_with_randomundersampler(
     X_train_sfs,
     y_train,
     num_classes=2,
@@ -27,11 +27,12 @@ def train_model_with_smote(
     patience_early=160,
 ):
     """
-    Apply SMOTE, train RegularizedDNN, and return the trained model plus
-    tensors used for training.
+    Apply RandomUnderSampler on the training set, then train RegularizedDNN.
     """
-    smote = SMOTE(random_state=44)
-    X_train_resampled, y_train_resampled = smote.fit_resample(X_train_sfs, y_train)
+
+    # ---- RandomUnderSampler on the (SFS-selected) training set ----
+    rus = RandomUnderSampler(random_state=44)
+    X_train_resampled, y_train_resampled = rus.fit_resample(X_train_sfs, y_train)
 
     X_train_tensor = torch.tensor(X_train_resampled, dtype=torch.float32)
     y_train_tensor = torch.tensor(y_train_resampled.values, dtype=torch.long)
